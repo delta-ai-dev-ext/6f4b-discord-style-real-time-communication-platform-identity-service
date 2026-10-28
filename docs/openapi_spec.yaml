@@ -1,0 +1,838 @@
+openapi: "3.0.3"
+info:
+  title: identity_service API
+  version: "1.0.0"
+  description: >
+    Local profile mirror of Clerk users and friend-domain ownership for the
+    platform: username and batch profile lookups, friend-request lifecycle
+    (send, accept, decline, cancel), friendships, and friend domain events.
+    Authentication uses Clerk session JWTs verified offline; the Clerk webhook
+    endpoint authenticates by Svix signature instead of a bearer token.
+
+servers:
+  - url: /
+    description: Current deployment (pod/ingress root)
+
+tags:
+  - name: me
+  - name: users
+  - name: friend-requests
+  - name: friends
+  - name: webhooks
+  - name: health
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/me:
+    get:
+      operationId: getMyProfile
+      summary: Get the caller's own profile
+      description: >
+        Returns the caller's profile mirror. If no mirror row exists yet
+        (Clerk webhook not yet processed), the profile is lazily bootstrapped
+        from the verified session-token claims before being returned.
+      tags: [me]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Own profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /v1/users/by-username/{username}:
+    get:
+      operationId: getUserByUsername
+      summary: Find a user by exact username
+      description: >
+        Exact-match, case-insensitive username lookup. Soft-deleted profiles
+        are unsearchable. Only public profile fields are returned.
+      tags: [users]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: username
+          in: path
+          required: true
+          description: Exact username to resolve (case-insensitive).
+          schema:
+            $ref: '#/components/schemas/Username'
+      responses:
+        "200":
+          description: Public profile found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicProfile'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          description: No active user owns that username
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: username_not_found
+                  message: No active user found with that username.
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /v1/users:batch:
+    post:
+      operationId: batchGetUsers
+      summary: Batch-resolve public profiles by user ids
+      description: >
+        Resolves up to 100 user ids to public profiles. Ids that do not
+        resolve to an active user are omitted from the response; the request
+        does not fail for individual misses.
+      tags: [users]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchUserLookupRequest'
+      responses:
+        "200":
+          description: Resolved public profiles (subset of the requested ids)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchUserLookupResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "422":
+          description: Batch limit exceeded or invalid payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: batch_limit_exceeded
+                  message: A batch may contain at most 100 user ids.
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /v1/friend-requests:
+    post:
+      operationId: sendFriendRequest
+      summary: Send a friend request by username
+      description: >
+        Creates a pending friend request to the user owning the given
+        username. Rejects unknown users, self-requests, duplicate pending
+        requests (in either direction) and requests to existing friends.
+      tags: [friend-requests]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendFriendRequestRequest'
+      responses:
+        "201":
+          description: Friend request created (pending)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendRequest'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          description: No active user owns the given username
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: username_not_found
+                  message: No active user found with that username.
+        "409":
+          description: Duplicate pending request or already friends
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                duplicate:
+                  value:
+                    error:
+                      code: duplicate_request
+                      message: A pending friend request already exists between you.
+                already_friends:
+                  value:
+                    error:
+                      code: already_friends
+                      message: You are already friends with this user.
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      operationId: listFriendRequests
+      summary: List friend requests addressed to or sent by the caller
+      description: >
+        Cursor-paginated list of friend requests, filterable by direction
+        (incoming/outgoing) and status. Defaults to incoming pending requests.
+      tags: [friend-requests]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: direction
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [incoming, outgoing]
+            default: incoming
+          description: Whether to list requests addressed to me or sent by me.
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/FriendRequestStatus'
+          description: Filter by request status. Defaults to `pending`.
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Opaque continuation cursor from a previous page.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Paginated friend requests
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendRequestListResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /v1/friend-requests/{request_id}/accept:
+    post:
+      operationId: acceptFriendRequest
+      summary: Accept a pending friend request
+      description: >
+        Recipient-only. Transitions the request to `accepted` and creates the
+        friendship. Emits `friend_request_accepted` for email and live UI
+        updates.
+      tags: [friend-requests]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FriendRequestId'
+      responses:
+        "200":
+          description: Friendship created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Friendship'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          description: No pending request addressed to the caller with that id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: request_not_found
+                  message: No pending friend request addressed to you with that id.
+        "409":
+          description: Request is not in the pending state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: request_not_pending
+                  message: This friend request is no longer pending.
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /v1/friend-requests/{request_id}/decline:
+    post:
+      operationId: declineFriendRequest
+      summary: Decline a pending friend request
+      description: Recipient-only. Transitions the request to `declined`.
+      tags: [friend-requests]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FriendRequestId'
+      responses:
+        "200":
+          description: Updated request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          description: No pending request addressed to the caller with that id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: request_not_found
+                  message: No pending friend request addressed to you with that id.
+        "409":
+          description: Request is not in the pending state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: request_not_pending
+                  message: This friend request is no longer pending.
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /v1/friend-requests/{request_id}:
+    delete:
+      operationId: cancelFriendRequest
+      summary: Cancel an outgoing pending friend request
+      description: Sender-only. Transitions the request to `cancelled` (204).
+      tags: [friend-requests]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FriendRequestId'
+      responses:
+        "204":
+          description: Request cancelled
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          description: No pending request sent by the caller with that id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: request_not_found
+                  message: No pending friend request sent by you with that id.
+        "409":
+          description: Request is not in the pending state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: request_not_pending
+                  message: This friend request is no longer pending.
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /v1/friends:
+    get:
+      operationId: listFriends
+      summary: List the caller's friends
+      description: Cursor-paginated list of the caller's friends as public profiles.
+      tags: [friends]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Opaque continuation cursor from a previous page.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Paginated friend profiles
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendListResponse'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /v1/friends/{user_id}:
+    delete:
+      operationId: removeFriend
+      summary: Remove a friend
+      description: >
+        Removes the (mutual) friendship. Emits `friendship_removed` for live
+        UI updates on both sides.
+      tags: [friends]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Platform user id of the friend to remove.
+      responses:
+        "204":
+          description: Friendship removed
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          description: No friendship between the caller and that user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: friendship_not_found
+                  message: You are not friends with this user.
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /v1/webhooks/clerk:
+    post:
+      operationId: clerkWebhook
+      summary: Receive Clerk profile events
+      description: >
+        Svix-signed webhook delivering `user.created`, `user.updated` and
+        `user.deleted` events. Authenticates by signature verification only
+        (no bearer token). Idempotent by Svix message id; replays are no-ops.
+        On `user.deleted` the profile is soft-deleted and pending friend
+        requests involving the user are cancelled.
+      tags: [webhooks]
+      security: []
+      parameters:
+        - name: svix-id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: svix-timestamp
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: svix-signature
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClerkWebhookEvent'
+      responses:
+        "200":
+          description: Event accepted (also returned for already-processed replays)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        "401":
+          description: Signature verification failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: invalid_signature
+                  message: Webhook signature verification failed.
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /healthz:
+    get:
+      operationId: getHealthz
+      summary: Liveness probe
+      description: Returns whether the process is up and responsive. No dependency checks.
+      tags: [health]
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /readyz:
+    get:
+      operationId: getReadyz
+      summary: Readiness probe
+      description: >
+        Returns whether the pod can serve traffic: PostgreSQL reachable and
+        the Kafka producer connected.
+      tags: [health]
+      security: []
+      responses:
+        "200":
+          description: Ready to serve traffic
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        "503":
+          description: Dependencies not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Clerk session JWT (short-lived) with custom claims
+        `sub` (= platform user_id), `username` and `email`. Verified offline
+        against Clerk's published public key/JWKS.
+
+  parameters:
+    FriendRequestId:
+      name: request_id
+      in: path
+      required: true
+      description: Friend request id.
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    Username:
+      type: string
+      description: >
+        Unique per Clerk instance; owned by Clerk at sign-up. Stored and
+        matched case-insensitively.
+      pattern: '^[A-Za-z0-9._-]{2,32}$'
+      example: "pixel_pioneer"
+
+    UserProfile:
+      type: object
+      required: [user_id, username, display_name, avatar_url, email, created_at, updated_at]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: Clerk user id (the session-token `sub` claim).
+        username:
+          $ref: '#/components/schemas/Username'
+        display_name:
+          type: string
+          example: "Pixel Pioneer"
+        avatar_url:
+          type: string
+          description: Avatar image URL (served from the identity provider).
+        email:
+          type: string
+          format: email
+          description: Primary email (own profile only).
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    PublicProfile:
+      type: object
+      description: Non-private projection of a user profile.
+      required: [user_id, username, display_name, avatar_url]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        username:
+          $ref: '#/components/schemas/Username'
+        display_name:
+          type: string
+          example: "Pixel Pioneer"
+        avatar_url:
+          type: string
+          description: Avatar image URL (served from the identity provider).
+
+    BatchUserLookupRequest:
+      type: object
+      required: [user_ids]
+      properties:
+        user_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+          maxItems: 100
+          description: Up to 100 platform user ids to resolve.
+
+    BatchUserLookupResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicProfile'
+          description: Profiles for the ids that resolved to active users.
+
+    SendFriendRequestRequest:
+      type: object
+      required: [username]
+      properties:
+        username:
+          $ref: '#/components/schemas/Username'
+
+    FriendRequestStatus:
+      type: string
+      enum: [pending, accepted, declined, cancelled]
+
+    FriendRequest:
+      type: object
+      required: [request_id, sender_user_id, recipient_user_id, status, created_at]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        sender_user_id:
+          type: string
+          format: uuid
+        recipient_user_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/FriendRequestStatus'
+        created_at:
+          type: string
+          format: date-time
+        responded_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set when the request leaves the pending state.
+
+    Friendship:
+      type: object
+      description: Unordered mutual pair stored with a < b.
+      required: [user_id_a, user_id_b, created_at]
+      properties:
+        user_id_a:
+          type: string
+          format: uuid
+          description: Lexicographically smaller user id of the pair.
+        user_id_b:
+          type: string
+          format: uuid
+          description: Lexicographically larger user id of the pair.
+        created_at:
+          type: string
+          format: date-time
+
+    FriendRequestListResponse:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/FriendRequest'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Cursor for the next page, or null when no more results.
+
+    FriendListResponse:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicProfile'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Cursor for the next page, or null when no more results.
+
+    ClerkWebhookEvent:
+      type: object
+      description: >
+        Clerk event payload (Svix envelope). `type` is one of `user.created`,
+        `user.updated`, `user.deleted`; `data.id` carries the Clerk user id.
+      required: [type, data]
+      properties:
+        type:
+          type: string
+          enum: [user.created, user.updated, user.deleted]
+        data:
+          type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              description: Clerk user id affected by the event.
+            username:
+              type: string
+            first_name:
+              type: string
+              nullable: true
+            last_name:
+              type: string
+              nullable: true
+            image_url:
+              type: string
+            email_addresses:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  email_address:
+                    type: string
+                  verification:
+                    type: object
+                    nullable: true
+            deleted:
+              type: boolean
+
+    WebhookAck:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+
+    ErrorResponse:
+      type: object
+      description: >
+        Platform error contract. `code` is a stable machine-readable value
+        (e.g. `username_not_found`, `duplicate_request`, `already_friends`,
+        `self_request`, `request_not_found`, `request_not_pending`,
+        `friendship_not_found`, `batch_limit_exceeded`).
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: username_not_found
+            message:
+              type: string
+              example: No active user found with that username.
+            details:
+              description: Optional machine-readable context for the error.
+
+  responses:
+    BadRequest:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: validation_error
+              message: Request body is invalid.
+    Unauthorized:
+      description: Authentication required or session token invalid/expired
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: unauthorized
+              message: A valid session token is required.
+    UnprocessableEntity:
+      description: Semantically invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: validation_error
+              message: Request is semantically invalid.
+    TooManyRequests:
+      description: Per-user rate limit exceeded (per-pod token bucket)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: rate_limited
+              message: Too many friend requests. Please try again later.
+    InternalError:
+      description: Unexpected server error (no internal details exposed)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: internal_error
+              message: An unexpected error occurred.

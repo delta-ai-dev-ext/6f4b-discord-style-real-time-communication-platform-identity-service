@@ -1,0 +1,171 @@
+schema_version: 2
+diagram_id: identity-service
+mode: service
+orientation: LR
+scope: 'identity_service service view: Clerk profile mirror and friend domain, inbound
+  Clerk webhooks, own PostgreSQL database, identity_friend_events Kafka producer only.'
+sources:
+- path: docs/architecture.md
+  sha256: d27ebb055eb21ce62e7773797f0e2a4ec6f291137ca1c6b253998b00b5d74c15
+- path: docs/decisions/ADR-001-lazy-profile-upsert-from-jwt-claims.md
+  sha256: 5e4082c7824a56fea18bb2d80ae379974e4b81e21fb66cc9653cabf155846521
+- path: docs/decisions/ADR-002-transactional-outbox-for-friend-events.md
+  sha256: cb83ce142e7eb686d1100a8a0c9a3ca0ed0d441c9b5955aa978e9b9b24d575f8
+- path: docs/openapi_spec.yaml
+  sha256: bdfc6ea701b9f7b29cb59493cee0dd4f82581c263e227bf41e863f702a5ba17e
+- path: docs/user_stories.md
+  sha256: 0aa3c0b0e72b83e18a3b600f29a92ecc852748f10e5d428b2921e57655baa471
+entities:
+- id: caller_web
+  label: Signed-in user
+  kind: annotation
+  role: inbound
+  row: 302
+  evidence:
+  - path: docs/architecture.md
+    quote: Client ── Bearer <session_jwt> ──► HTTP layer
+- id: caller_clerk
+  label: Clerk identity provider
+  kind: annotation
+  role: inbound
+  row: 372
+  evidence:
+  - path: docs/architecture.md
+    quote: '**External provider:** Clerk (inbound webhooks + offline JWT verification
+      — no outbound Clerk calls in the request path)'
+  - path: docs/openapi_spec.yaml
+    quote: Svix-signed webhook delivering `user.created`, `user.updated` and
+- id: svc
+  name: identity_service
+  label: identity_service
+  kind: service
+  technology: kubernetes-pod
+  role: service
+  row: 260
+  evidence:
+  - path: docs/architecture.md
+    quote: '`identity_service` is the platform''s local mirror of Clerk identities
+      and the'
+  - path: docs/architecture.md
+    quote: '| Profile mirror of Clerk users | Keyed by Clerk user id; username, display
+      name, avatar URL, primary email, soft-delete flag. Synced from Clerk webhooks;
+      lazily bootstrapped from JWT claims (ADR-001). |'
+- id: db
+  label: identity_service PostgreSQL
+  kind: database
+  technology: postgresql
+  role: outbound
+  row: 383
+  evidence:
+  - path: docs/architecture.md
+    quote: One logical database owned exclusively by this service; no cross-service
+      table
+- id: events
+  name: identity_friend_events
+  label: identity_friend_events
+  kind: broker
+  technology: kafka
+  role: outbound
+  row: 10
+  evidence:
+  - path: docs/architecture.md
+    quote: '| Friend domain events | Produces `identity_friend_events` for `notification_service`
+      (email) and `realtime_gateway` (live updates). |'
+relationships:
+- id: r-user
+  source: caller_web
+  target: svc
+  type: request
+  direction: forward
+  interaction:
+    channel: direct
+    purpose: profile and friend API calls
+    protocol: HTTP
+    exchange_id: client-api-calls
+  evidence:
+  - path: docs/architecture.md
+    quote: Client ── Bearer <session_jwt> ──► HTTP layer
+  - path: docs/openapi_spec.yaml
+    quote: 'openapi: "3.0.3"'
+- id: r-clerk
+  source: caller_clerk
+  target: svc
+  type: request
+  direction: forward
+  interaction:
+    channel: direct
+    purpose: profile sync webhook
+    protocol: webhook
+    exchange_id: clerk-webhook
+  evidence:
+  - path: docs/openapi_spec.yaml
+    quote: Svix-signed webhook delivering `user.created`, `user.updated` and
+  - path: docs/architecture.md
+    quote: Clerk/Svix ── POST + svix-id/timestamp/signature headers ──► HTTP layer
+- id: r-db
+  source: svc
+  target: db
+  type: ownership
+  evidence:
+  - path: docs/architecture.md
+    quote: One logical database owned exclusively by this service; no cross-service
+      table
+- id: r-kafka
+  source: svc
+  target: events
+  type: event
+  direction: forward
+  interaction:
+    channel: messaging
+    purpose: friend domain events
+    protocol: Kafka
+  messaging:
+    role: producer
+    topic: identity_friend_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '| Friend domain events | Produces `identity_friend_events` for `notification_service`
+      (email) and `realtime_gateway` (live updates). |'
+  - path: docs/architecture.md
+    quote: '**Runtime:** TypeScript (Bun) · **PostgreSQL:** yes (own logical DB) ·
+      **Kafka:** producer only · **S3:** not used'
+view:
+  entities:
+  - caller_web
+  - caller_clerk
+  - svc
+  - db
+  - events
+  groups: []
+  edges:
+  - id: e-user
+    source: caller_web
+    target: svc
+    relationships:
+    - r-user
+    label: REST
+    flow: forward
+  - id: e-clerk
+    source: caller_clerk
+    target: svc
+    relationships:
+    - r-clerk
+    label: webhook
+    flow: forward
+  - id: e-db
+    source: svc
+    target: db
+    relationships:
+    - r-db
+    label: SQL
+    flow: forward
+  - id: e-kafka
+    source: svc
+    target: events
+    relationships:
+    - r-kafka
+    label: 'Producers
+
+      identity_service:identity_friend_events'
+    flow: forward
+  omitted: []
