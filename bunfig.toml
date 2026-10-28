@@ -1,0 +1,5 @@
+[test]
+coverage = true
+coverageThreshold = { line = 0.8, function = 0.8, statement = 0.8 }
+coverageSkipTestFiles = true
+coveragePathIgnorePatterns = ["src/db/migrations/**", "src/index.ts"]
