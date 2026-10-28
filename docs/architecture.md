@@ -38,7 +38,7 @@ DMs or direct calls (MVP exclusion), no message reporting.
 
 ```
                     ┌────────────────────────────────────────────────────────┐
- Ingress (K8s) ───► │ HTTP layer (router, thin controllers)                  │
+ Ingress ───► │ HTTP layer (router, thin controllers)                  │
                     │  ├── auth middleware ── offline Clerk JWT verification │
                     │  │                                     (JWKS public key)│
                     │  ├── /v1/webhooks/clerk ── Svix signature verification │
@@ -297,9 +297,9 @@ CREATE INDEX outbox_event_pending_idx
 
 ---
 
-## 5. Kubernetes Operational Model
+## Container Operational Model
 
-**Stateless pod.** No local state beyond caches; everything durable lives in
+**Stateless replica.** No local state beyond caches; everything durable lives in
 PostgreSQL and Kafka. Replicas ≥ 1; horizontal scale is safe because:
 
 - all request paths are read-mostly or short transactions,

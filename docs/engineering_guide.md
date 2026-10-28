@@ -1,7 +1,7 @@
 # `identity_service` — Engineering Guide
 
 Persistent technical memory for this service: runtime, libraries and external
-provider SDKs, Kubernetes lifecycle, testing strategy, conventions,
+provider SDKs, container lifecycle, testing strategy, conventions,
 configuration, observability, and append-only **Pinned Decisions**.
 
 Architectural behavior (flows, schema, events, failure modes) lives in
@@ -59,7 +59,7 @@ Forbidden anywhere in this service: `uuid`, `dotenv` in production, `axios`,
 
 ---
 
-## Kubernetes Lifecycle & Probes
+## Container Lifecycle & Probes
 
 **Statelessness rules**
 
@@ -187,7 +187,7 @@ loading in production.
 Rules:
 
 - Secrets (`CLERK_WEBHOOK_SIGNING_SECRET`, DB credentials inside `DATABASE_URL`)
-  come from Kubernetes secrets only; never logged, never echoed in errors.
+  come from your platform secret store only; never logged, never echoed in errors.
 - Topic name `identity_friend_events` is a platform contract, not a config
   knob — it is a constant in code.
 
